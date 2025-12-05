@@ -103,6 +103,7 @@ pub fn launch_app(app_name: &str, verbose: bool) -> Result<()> {
 }
 
 fn launch_search_result(res: SearchResult) -> Result<()> {
+    #[cfg(target_os = "linux")]
     if res.is_desktop {
         if let Some(exec) = res.exec {
             println!("Launching desktop entry: {:?} (Exec={})", res.path, exec);
@@ -286,7 +287,6 @@ fn launch_executable(path: &Path) -> Result<()> {
             }
         }
 
-        // Try executing directly
         if Command::new(path).spawn().is_ok() {
             return Ok(());
         }
