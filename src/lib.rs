@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use strsim::levenshtein;
 use walkdir::WalkDir;
 
@@ -12,14 +12,29 @@ struct SearchResult {
     is_desktop: bool,
 }
 
-/// Attempts to launch an application by its name.
+/// Options for [`launch_app_with_options`]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LaunchOptions {
+    /// Print progress information
+    pub verbose: bool,
+    /// Wait until the launched application exits instead of returning once it has started
+    pub blocking: bool,
+}
+
+/// Attempts to launch an application by its name, returning once it has started.
 pub fn launch_app(app_name: &str, verbose: bool) -> Result<()> {
+    launch_app_with_options(app_name, LaunchOptions { verbose, blocking: false })
+}
+
+/// Attempts to launch an application by its name.
+pub fn launch_app_with_options(app_name: &str, options: LaunchOptions) -> Result<()> {
+    let LaunchOptions { verbose, blocking } = options;
     if verbose {
         println!("Attempting to launch '{}'...", app_name);
     }
 
     // 1. Fast Path (Native)
-    if let Ok(()) = launch_app_native(app_name) {
+    if let Ok(()) = launch_app_native(app_name, blocking) {
         if verbose {
             println!("Successfully launched '{}' using native command.", app_name);
         }
@@ -50,7 +65,7 @@ pub fn launch_app(app_name: &str, verbose: bool) -> Result<()> {
                 if verbose {
                     println!("Found exact desktop entry match.");
                 }
-                return launch_search_result(res);
+                return launch_search_result(res, blocking);
             }
             update_best(res);
         }
@@ -67,7 +82,7 @@ pub fn launch_app(app_name: &str, verbose: bool) -> Result<()> {
             if verbose {
                 println!("Found exact common path match.");
             }
-            return launch_search_result(res);
+            return launch_search_result(res, blocking);
         }
         update_best(res);
     }
@@ -83,7 +98,7 @@ pub fn launch_app(app_name: &str, verbose: bool) -> Result<()> {
             if verbose {
                 println!("Found exact filesystem match.");
             }
-            return launch_search_result(res);
+            return launch_search_result(res, blocking);
         }
         update_best(res);
     }
@@ -96,27 +111,42 @@ pub fn launch_app(app_name: &str, verbose: bool) -> Result<()> {
                 res.score
             );
         }
-        return launch_search_result(res);
+        return launch_search_result(res, blocking);
     }
 
     bail!("Could not find or launch application: {}", app_name);
 }
 
-fn launch_search_result(res: SearchResult) -> Result<()> {
+fn launch_search_result(res: SearchResult, blocking: bool) -> Result<()> {
     #[cfg(target_os = "linux")]
     if res.is_desktop {
         if let Some(exec) = res.exec {
             println!("Launching desktop entry: {:?} (Exec={})", res.path, exec);
-            return execute_desktop_entry(&exec);
+            return execute_desktop_entry(&exec, blocking);
         }
     }
 
     println!("Launching: {:?}", res.path);
-    launch_executable(&res.path)
+    launch_executable(&res.path, blocking)
+}
+
+/// Run `command`: wait for it to exit and check its status when `blocking`, otherwise only
+/// start it. Its output is discarded either way.
+fn run(command: &mut Command, blocking: bool) -> Result<()> {
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    if blocking {
+        let status = command.status()?;
+        if !status.success() {
+            bail!("Application exited with {}", status);
+        }
+    } else {
+        command.spawn()?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn execute_desktop_entry(exec: &str) -> Result<()> {
+fn execute_desktop_entry(exec: &str, blocking: bool) -> Result<()> {
     let parts: Vec<&str> = exec
         .split_whitespace()
         .filter(|p| !p.starts_with('%'))
@@ -128,12 +158,7 @@ fn execute_desktop_entry(exec: &str) -> Result<()> {
     let cmd = parts[0];
     let args = &parts[1..];
 
-    Command::new(cmd)
-        .args(args)
-        .spawn()
-        .context("Failed to spawn desktop entry command")?;
-
-    Ok(())
+    run(Command::new(cmd).args(args), blocking).context("Failed to run desktop entry command")
 }
 
 #[cfg(target_os = "linux")]
@@ -221,10 +246,15 @@ fn search_desktop_entries(
     best_res
 }
 
+// `start` and `open` return once the application has started; `/WAIT` and `-W` make them wait
+// for it to exit
 #[cfg(target_os = "windows")]
-fn launch_app_native(app_name: &str) -> Result<()> {
+fn launch_app_native(app_name: &str, blocking: bool) -> Result<()> {
+    let wait: &[&str] = if blocking { &["/WAIT"] } else { &[] };
     let output = Command::new("cmd")
-        .args(["/C", "start", "", app_name])
+        .args(["/C", "start"])
+        .args(wait)
+        .args(["", app_name])
         .output()?;
     if output.status.success() {
         Ok(())
@@ -234,8 +264,9 @@ fn launch_app_native(app_name: &str) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn launch_app_native(app_name: &str) -> Result<()> {
-    let output = Command::new("open").args(["-a", app_name]).output()?;
+fn launch_app_native(app_name: &str, blocking: bool) -> Result<()> {
+    let wait: &[&str] = if blocking { &["-W"] } else { &[] };
+    let output = Command::new("open").args(wait).args(["-a", app_name]).output()?;
     if output.status.success() {
         Ok(())
     } else {
@@ -244,24 +275,21 @@ fn launch_app_native(app_name: &str) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn launch_app_native(app_name: &str) -> Result<()> {
-    let output = Command::new(app_name).output();
-    match output {
-        Ok(o) if o.status.success() => Ok(()),
-        _ => bail!("Failed to launch on Linux"),
-    }
+fn launch_app_native(app_name: &str, blocking: bool) -> Result<()> {
+    run(&mut Command::new(app_name), blocking).context("Failed to launch on Linux")
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-fn launch_app_native(_: &str) -> Result<()> {
+fn launch_app_native(_: &str, _: bool) -> Result<()> {
     bail!("Unsupported platform")
 }
 
-fn launch_executable(path: &Path) -> Result<()> {
+fn launch_executable(path: &Path, blocking: bool) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         if path.extension().map_or(false, |ext| ext == "app") {
-            let output = Command::new("open").arg(path).output()?;
+            let wait: &[&str] = if blocking { &["-W"] } else { &[] };
+            let output = Command::new("open").args(wait).arg(path).output()?;
             if output.status.success() {
                 return Ok(());
             }
@@ -270,8 +298,11 @@ fn launch_executable(path: &Path) -> Result<()> {
 
     #[cfg(target_os = "windows")]
     {
+        let wait: &[&str] = if blocking { &["/WAIT"] } else { &[] };
         let output = Command::new("cmd")
-            .args(["/C", "start", "", &path.to_string_lossy()])
+            .args(["/C", "start"])
+            .args(wait)
+            .args(["", &path.to_string_lossy()])
             .output()?;
         if output.status.success() {
             return Ok(());
@@ -280,31 +311,28 @@ fn launch_executable(path: &Path) -> Result<()> {
 
     #[cfg(target_os = "linux")]
     {
-        let output = Command::new("xdg-open").arg(path).output();
-        if let Ok(o) = output {
-            if o.status.success() {
-                return Ok(());
+        // xdg-open returns once the application has started, so it can't be used to wait
+        if !blocking {
+            let output = Command::new("xdg-open").arg(path).output();
+            if let Ok(o) = output {
+                if o.status.success() {
+                    return Ok(());
+                }
             }
         }
 
-        if Command::new(path).spawn().is_ok() {
+        if run(&mut Command::new(path), blocking).is_ok() {
             return Ok(());
         }
 
         // Fallback to sh
-        Command::new("sh")
-            .arg(path)
-            .spawn()
-            .context("Failed to spawn executable (tried xdg-open, direct execution, and sh)")?;
-        Ok(())
+        run(Command::new("sh").arg(path), blocking)
+            .context("Failed to run executable (tried xdg-open, direct execution, and sh)")
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        Command::new(path)
-            .spawn()
-            .context("Failed to spawn executable")?;
-        Ok(())
+        run(&mut Command::new(path), blocking).context("Failed to run executable")
     }
 }
 

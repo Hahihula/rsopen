@@ -23,6 +23,9 @@ rsopen firefox
 
 # Launch with verbose output (to see search process)
 rsopen -v "Terminal"
+
+# Wait until the application exits
+rsopen --blocking firefox
 ```
 
 ### As a Library
@@ -33,6 +36,20 @@ use rsopen::launch_app;
 fn main() {
     // Launch 'firefox' with verbose=false
     if let Err(e) = launch_app("firefox", false) {
+        eprintln!("Error: {}", e);
+    }
+}
+```
+
+`launch_app` returns as soon as the application has started. To wait until it exits, use
+`launch_app_with_options`:
+
+```rust
+use rsopen::{launch_app_with_options, LaunchOptions};
+
+fn main() {
+    let options = LaunchOptions { verbose: false, blocking: true };
+    if let Err(e) = launch_app_with_options("firefox", options) {
         eprintln!("Error: {}", e);
     }
 }
